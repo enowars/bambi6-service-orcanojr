@@ -14,7 +14,7 @@ COPY Config /root/.dolphin-emu/Config
 # Configure service
 WORKDIR /service
 RUN mkdir data
-COPY service.py image.dol ./
+COPY service.py image.elf ./
 
 # Set unbuffered mode so we get stdout
 ENV PYTHONUNBUFFERED=1

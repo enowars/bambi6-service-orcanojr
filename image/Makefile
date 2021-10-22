@@ -25,8 +25,10 @@ INCLUDES	:=
 # options for code generation
 #---------------------------------------------------------------------------------
 
-ASFLAGS     = 
-CFLAGS		= -DOC_FINAL -g -O2 -Wall $(MACHDEP) $(INCLUDE)
+DEFINES     = -DOC_FINAL
+#DEFINES     = 
+ASFLAGS     = $(DEFINES)
+CFLAGS		= $(DEFINES) -g -O1 -Werror -Wall -Wextra $(MACHDEP) $(INCLUDE)
 CXXFLAGS	= $(CFLAGS)
 
 LDFLAGS		= -g $(MACHDEP) -Wl,-Map,$(notdir $@).map

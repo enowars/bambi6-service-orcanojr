@@ -10,23 +10,21 @@ import asyncio
 import traceback
 import subprocess
 
-import secrets
-from Crypto.Cipher import ChaCha20
-
 SERVICE_PORT = 53273
 QUEUE_MAX_LEN = 64
 DOLPHIN_PATH = os.getenv("DOLPHIN_EMU_NOGUI")
-IMAGE_PATH = "./image.dol"
+IMAGE_PATH = "./image.elf"
 DATA_DIR = "/data"
-WORKER_COUNT = 2
+WORKER_COUNT = 1
+WORKER_MAX_REQUESTS = 1 # how many requests a worker can handle before restart
 DATA_CLEANUP_EXPIRY_TIME = 15 * 60 # 15 minutes ~= 1 min/round * 10 rounds + margin
 DATA_CLEANUP_CYCLE_TIME = 5 * 60 # guarantees max age 20 minutes
-LOG_DEBUG = False
+LOG_DEBUG = True
 
 MAX_REQUEST_SIZE = 1024 # maximum size for request to be passed into Dolphin
 MAX_REQUEST_TIME = 0.25
 DOL_TIMEOUT = 2.0 # timeout for comms with Dolphin before abort & restart
-DOL_STARTUP_TIME = 20.0 # how long to wait for Dolphin to start up in seconds
+DOL_STARTUP_TIME = 10.0 # how long to wait for Dolphin to start up in seconds
 DOL_STARTUP_INTERVAL = 0.05 # wait time between successive attempts to get to Dolphin
 
 def log_debug(text):
@@ -145,6 +143,10 @@ class OrcanoFrontend:
 			except ConnectionRefusedError:
 				pass
 
+			if inst["dol_fut"].done():
+				print("Dolphin died before connection could be established, port={}".format(inst["dol_port"]))
+				break
+
 			print("Dolphin connection failed, retrying ({})...".format(i))
 			await asyncio.sleep(DOL_STARTUP_INTERVAL)
 
@@ -200,79 +202,15 @@ class OrcanoFrontend:
 
 		class DolphinCommunicationError(Exception): pass
 
-		async def process_request(task, persistent):
-			otp = persistent.get("otp", {
-				"uid": None,
-				"storage": b"",
-				"offset": 0,
-			})
-
-			def otp_acquire(uid):
-				if uid == otp["uid"]:
-					return
-
-				otp_path = os.path.join(DATA_DIR, "otp_{:016x}".format(uid))
-
-				# New OTP user. Acquire some secret material.
-				try:
-					with open(otp_path, "rb") as f:
-						otp_secret = bytearray(f.read())
-				except FileNotFoundError:
-					# OTP not enabled for this account
-					otp_authenticated = False
-					otp["uid"] = None
-					otp["storage"] = b""
-					return
-
-				otp_authenticated = False
-				otp["uid"] = uid
-				otp["offset"] = struct.unpack_from(">L", otp_secret, 0x0)[0]
-				gen = ChaCha20.new(key=otp_secret[0x4:0x24], nonce=otp_secret[0x24:0x2c])
-				gen.seek(otp["offset"] * 8)
-				otp_storage_size = 32
-				otp["storage"] = gen.encrypt(b"\x00" * otp_storage_size)
-				struct.pack_into(">L", otp_secret, 0x0, otp["offset"] + (otp_storage_size // 8))
-
-				with open(otp_path, "wb") as f:
-					f.write(otp_secret)
-			def otp_get_code():
-				if not otp["storage"]:
-					# Not authenticated or out of codes
-					return None
-				return struct.unpack_from(">Q", otp["storage"], 0x0)[0]
-			def otp_advance():
-				if not otp["storage"]:
-					# Not authenticated or out of codes
-					return
-				otp["storage"] = otp["storage"][8:]
-				otp["offset"] += 1
-			def missing_otp_auth(uid):
-				try:
-					with open(os.path.join(DATA_DIR, "otp_{:016x}".format(uid))) as f:
-						pass
-					user_has_otp = True
-				except FileNotFoundError:
-					user_has_otp = False
-
-				# OTP enabled?
-				if not user_has_otp:
-					return False
-
-				# OTP is enabled, authenticated?
-				if otp["uid"] == uid and otp_authenticated:
-					return False
-
-				return True
+		async def process_request(task):
 			# Send the initial request
-			await dol_timeout(dol_write_msg(b"REQQ", task["data"]))
+			await dol_timeout(dol_write_msg(b"REQQ", task["data"] + b"\x00"))
 
 			# Respond to queries
 			result = bytearray()
 			while True:
 				ident, data = await dol_timeout(dol_read_msg())
 				if ident == b"REQA":
-					result += data
-					result += b"\n"
 					break
 				elif ident == b"GTNQ":
 					if len(data) != 0xc:
@@ -281,17 +219,13 @@ class OrcanoFrontend:
 					uid = struct.unpack_from(">Q", data, 0x0)[0]
 					idx = struct.unpack_from(">L", data, 0x8)[0]
 
-					if missing_otp_auth(uid):
-						await dol_timeout(dol_write_msg(b"GTNA", b"\x00" * 8))
-						continue
-
 					# TODO: Should we check that this user exists here?
 					num_path = os.path.join(DATA_DIR, "num_{:016x}_{:08x}".format(uid, idx))
 					num_data = None
 					try:
 						with open(num_path, "rb") as f:
 							num_data = f.read()
-						if len(num_data) != 8:
+						if len(num_data) != 4:
 							print("Invalid number data read from disk for uid={:016x}, idx={:08x}".format(uid, idx))
 							num_data = None
 					except FileNotFoundError:
@@ -299,25 +233,19 @@ class OrcanoFrontend:
 
 					# Provide default
 					if num_data == None:
-						num_data = b"\x00" * 8
+						num_data = b"\x00\x00\x00\x00"
 
 					await dol_timeout(dol_write_msg(b"GTNA", num_data))
 				elif ident == b"STNQ":
-					if len(data) != 0x14:
+					if len(data) != 0x10:
 						raise DolphinCommunicationError("invalid setn query len 0x{:x}".format(len(data)))
 
 					uid = struct.unpack_from(">Q", data, 0x0)[0]
 					idx = struct.unpack_from(">L", data, 0x8)[0]
-					num_data = data[0xc:0x14]
-					num_type = struct.unpack_from(">L", num_data, 0)[0]
-					if num_type not in [0, 1]:
-						raise DolphinCommunicationError("invalid setn number type 0x{:x}".format(num_type))
-
+					num_data = data[0xc:0x10]
+					
 					# Protect anonymous user
 					if uid == 0 and (idx == 0x20000000 or idx == 0x20000001):
-						continue
-
-					if missing_otp_auth(uid):
 						continue
 
 					# Check for lock
@@ -344,109 +272,13 @@ class OrcanoFrontend:
 					if uid == 0:
 						continue
 
-					if missing_otp_auth(uid):
-						continue
-
 					# TODO: This shares code with STNQ
 					lock_path = os.path.join(DATA_DIR, "lock_{:016x}_{:08x}".format(uid, idx))
 
 					# Create the lock file if it didn't exist already
 					with open(lock_path, "wb") as f:
 						pass
-				elif ident == b"INSQ":
-					if len(data) < 4:
-						raise DolphinCommunicationError("invalid inspect query len 0x{:x}".format(len(data)))
-					int_count = struct.unpack_from(">L", data, 0x0)[0]
-					result += b"inspect:"
-					for i in range((len(data) - 4) // 4):
-						if i < int_count:
-							val = struct.unpack_from(">l", data, 0x4 + i * 4)[0]
-							result += " i{}".format(val).encode()
-						else:
-							val = struct.unpack_from(">f", data, 0x4 + i * 4)[0]
-							result += " f{:.9g}".format(val).encode()
-					result += b"\n"
-				elif ident == b"OTIQ":
-					# Init OTP
-					if len(data) != 8:
-						raise DolphinCommunicationError("invalid otp init query len 0x{:x}".format(len(data)))
-					uid = struct.unpack_from(">Q", data, 0x0)[0]
-
-					# Protect anonymous user
-					protected_user = False
-					if uid == 0:
-						protected_user = True
-
-					def check_file_exists(path):
-						try:
-							with open(path, "rb") as f:
-								pass
-							exists = True
-						except FileNotFoundError:
-							exists = False
-						return exists
-
-					# Check for existing OTP or user registration
-					otp_path = os.path.join(DATA_DIR, "otp_{:016x}".format(uid))
-					key0_path = os.path.join(DATA_DIR, "num_{:016x}_20000000".format(uid))
-					key1_path = os.path.join(DATA_DIR, "num_{:016x}_20000001".format(uid))
-					otp_exists = check_file_exists(otp_path)
-					key0_exists = check_file_exists(key0_path)
-					key1_exists = check_file_exists(key1_path)
-
-					if protected_user or otp_exists or key0_exists or key1_exists:
-						# User already exists, refuse enabling OTP
-						resp_data = b"\x00" * (4 + 32 + 8)
-					else:
-						# Init OTP
-						cc_key = secrets.token_bytes(32)
-						cc_nonce = secrets.token_bytes(8)
-						otp_data = b"\x00\x00\x00\x00" + cc_key + cc_nonce
-						with open(otp_path, "wb") as f:
-							f.write(otp_data)
-						# Send response
-						resp_data = b"\x00\x00\x00\x01" + cc_key + cc_nonce
-					await dol_timeout(dol_write_msg(b"OTIA", resp_data))
-				elif ident == b"OTAQ":
-					# Auth OTP
-					if len(data) != 0x10:
-						raise DolphinCommunicationError("invalid otp auth query len 0x{:x}".format(len(data)))
-					uid = struct.unpack_from(">Q", data, 0x0)[0]
-					code = struct.unpack_from(">Q", data, 0x8)[0]
-
-					otp_acquire(uid)
-					expected_code = otp_get_code()
-					if expected_code != code:
-						resp_data = b"\x00\x00\x00\x00"
-					else:
-						otp_authenticated = True
-						resp_data = b"\x00\x00\x00\x01"
-					await dol_timeout(dol_write_msg(b"OTAA", resp_data))
-				elif ident == b"OTGQ":
-					# Get OTP
-					if len(data) != 8:
-						raise DolphinCommunicationError("invalid otp get query len 0x{:x}".format(len(data)))
-					uid = struct.unpack_from(">Q", data, 0x0)[0]
-
-					otp_acquire(uid)
-					next_code = otp_get_code()
-					if next_code != None:
-						next_offset = otp["offset"]
-					else:
-						next_code = 0
-						next_offset = 0
-
-					resp_data = bytearray(0xc)
-					struct.pack_into(">L", resp_data, 0x0, next_offset)
-					struct.pack_into(">Q", resp_data, 0x4, next_code)
-					await dol_timeout(dol_write_msg(b"OTGA", resp_data))
-				elif ident == b"OTNQ":
-					# Next OTP
-					if len(data) != 0:
-						raise DolphinCommunicationError("invalid otp next query len 0x{:x}".format(len(data)))
-					otp_advance()
 				elif ident == b"PRTQ":
-					result += b"print: "
 					result += bytes(filter(lambda c: c in string.printable.encode(), data))
 					result += b"\n"
 				elif ident == b"LOGQ":
@@ -458,18 +290,16 @@ class OrcanoFrontend:
 					print("DOL bad msg: ident={} data={}".format(ident, data))
 					raise DolphinCommunicationError()
 
-			# Write back session data
-			persistent["otp"] = otp
 			return result
 
 		# Serve requests
-		while True:
-			task, persistent = await self.request_queue.get()
+		for request_index in range(WORKER_MAX_REQUESTS):
+			task = await self.request_queue.get()
 
 			request_start = datetime.datetime.utcnow()
 			print("Serving request to Dolphin on port {}: {}".format(inst["dol_port"], bytes(task["data"])))
 			try:
-				result = await asyncio.wait_for(process_request(task, persistent), MAX_REQUEST_TIME)
+				result = await asyncio.wait_for(process_request(task), MAX_REQUEST_TIME)
 			except (asyncio.IncompleteReadError, asyncio.TimeoutError, DolphinCommunicationError) as ex:
 				# Dolphin died or timed out
 				print("Request execution failed, traceback:")
@@ -477,9 +307,14 @@ class OrcanoFrontend:
 
 				# Restart Dolphin
 				await self.stop_dolphin(inst)
-				print("Shutdown complete, starting...")
-				inst = await self.start_dolphin()
-				print("Restart complete.")
+
+				# If not last request, restart
+				if request_index < WORKER_MAX_REQUESTS - 1:
+					print("Shutdown complete, starting...")
+					inst = await self.start_dolphin()
+					print("Restart complete.")
+				else:
+					print("Last request, no restart")
 
 				# Fail the request
 				if isinstance(ex, asyncio.TimeoutError):
@@ -497,12 +332,14 @@ class OrcanoFrontend:
 			task["result_fut"].set_result(result)
 			self.request_queue.task_done()
 
+		# Kill our instance on the way out
+		await self.stop_dolphin(inst)
+
 	async def handle_connection(self, client_rx, client_tx):
 		client_tx.write(b"Hey! Listen!\n")
 		await client_tx.drain()
 
 		# TODO: Network timeouts?
-		persistent = {}
 		try:
 			while True:
 				client_tx.write(b"> ")
@@ -529,7 +366,7 @@ class OrcanoFrontend:
 				}
 
 				# Submit for processing
-				await self.request_queue.put((task, persistent))
+				await self.request_queue.put(task)
 
 				# Wait for completion
 				result = await task_result_fut
