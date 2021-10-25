@@ -15,7 +15,7 @@ QUEUE_MAX_LEN = 64
 DOLPHIN_PATH = os.getenv("DOLPHIN_EMU_NOGUI")
 IMAGE_PATH = "./image.elf"
 DATA_DIR = "/data"
-WORKER_COUNT = 1
+WORKER_COUNT = 2
 WORKER_MAX_REQUESTS = 1 # how many requests a worker can handle before restart
 DATA_CLEANUP_EXPIRY_TIME = 15 * 60 # 15 minutes ~= 1 min/round * 10 rounds + margin
 DATA_CLEANUP_CYCLE_TIME = 5 * 60 # guarantees max age 20 minutes
