@@ -16,7 +16,8 @@ DOLPHIN_PATH = os.getenv("DOLPHIN_EMU_NOGUI")
 IMAGE_PATH = "./image.elf"
 DATA_DIR = "/data"
 WORKER_COUNT = 2
-WORKER_MAX_REQUESTS = 1 # how many requests a worker can handle before restart
+WORKER_MAX_REQUESTS = 512 # how many requests a worker can handle before restart
+WORKER_MAX_TRIES = 2 # how many times to try an individual request
 DATA_CLEANUP_EXPIRY_TIME = 15 * 60 # 15 minutes ~= 1 min/round * 10 rounds + margin
 DATA_CLEANUP_CYCLE_TIME = 5 * 60 # guarantees max age 20 minutes
 LOG_DEBUG = True
@@ -298,29 +299,33 @@ class OrcanoFrontend:
 
 			request_start = datetime.datetime.utcnow()
 			print("Serving request to Dolphin on port {}: {}".format(inst["dol_port"], bytes(task["data"])))
-			try:
-				result = await asyncio.wait_for(process_request(task), MAX_REQUEST_TIME)
-			except (asyncio.IncompleteReadError, asyncio.TimeoutError, DolphinCommunicationError) as ex:
-				# Dolphin died or timed out
-				print("Request execution failed, traceback:")
-				traceback.print_exc()
 
-				# Restart Dolphin
-				await self.stop_dolphin(inst)
+			result = None
+			for try_index in range(WORKER_MAX_TRIES):
+				try:
+					result = await asyncio.wait_for(process_request(task), MAX_REQUEST_TIME)
+					break
+				except (asyncio.IncompleteReadError, asyncio.TimeoutError, DolphinCommunicationError) as ex:
+					# Dolphin died or timed out
+					print("Request execution failed, traceback:")
+					traceback.print_exc()
 
-				# If not last request, restart
-				if request_index < WORKER_MAX_REQUESTS - 1:
-					print("Shutdown complete, starting...")
-					inst = await self.start_dolphin()
-					print("Restart complete.")
-				else:
-					print("Last request, no restart")
+					# Restart Dolphin
+					await self.stop_dolphin(inst)
 
-				# Fail the request
-				if isinstance(ex, asyncio.TimeoutError):
-					result = b"error: timeout\n"
-				else:
-					result = b"error: internal\n"
+					# If not last request, restart
+					if not (request_index == WORKER_MAX_REQUESTS - 1 and try_index < WORKER_MAX_TRIES - 1):
+						print("Shutdown complete, starting...")
+						inst = await self.start_dolphin()
+						print("Restart complete.")
+					else:
+						print("Last request, no restart")
+
+					# Fail the request
+					if isinstance(ex, asyncio.TimeoutError):
+						result = b"error: timeout\n"
+					else:
+						result = b"error: internal\n"
 
 			# For performance estimation
 			# TODO: Should probably get rid of this overhead for final
